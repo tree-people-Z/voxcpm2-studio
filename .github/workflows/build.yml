@@ -6,6 +6,10 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# 发布 Release 需要写权限（仓库默认给 GITHUB_TOKEN 只读）
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
