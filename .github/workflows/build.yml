@@ -3,12 +3,7 @@ name: build-windows
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   workflow_dispatch:
-
-# 发布 Release 需要写权限（仓库默认给 GITHUB_TOKEN 只读）
-permissions:
-  contents: write
 
 jobs:
   build:
@@ -54,10 +49,3 @@ jobs:
           name: VoxCPM2Studio-windows-x64
           path: VoxCPM2Studio-windows-x64.zip
           retention-days: 14
-
-      - name: 打 tag 时自动发布 Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: VoxCPM2Studio-windows-x64.zip
-          generate_release_notes: true

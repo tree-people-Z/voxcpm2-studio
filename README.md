@@ -2,7 +2,7 @@
 
 基于 **VoxCPM2**（OpenBMB，2B，tokenizer-free TTS）的本地语音合成桌面软件，PyQt6 图形界面，Windows 开箱即用。
 
-> **只想用、不想配环境？** 从 [Releases](../../releases) 下载 `VoxCPM2Studio-windows-x64.zip`，解压后双击
+> **只想用、不想配环境？** 打包成便携版：`build.bat`（或从 GitHub Actions 下载构建产物），解压后双击
 > `VoxCPM2Studio.exe`，首次启动会提示下载约 4.6 GB 模型（可断点续传、可取消）。
 
 ![界面预览](docs/screenshots/result.png)
@@ -48,9 +48,12 @@
 
 ## 安装
 
-### 方式 A：直接下载打包版（推荐）
+### 方式 A：便携版（解压即用）
 
-1. 到 [Releases](../../releases) 下 `VoxCPM2Studio-windows-x64.zip`（约 2.9 GB），**解压**到任意目录（建议路径不含空格、磁盘留 10 GB）。
+产物来源二选一：本地跑 `build.bat zip`，或从 GitHub Actions 的 `build-windows` 产物下载（保留 14 天）。
+说明：**没有提供 Releases 附件**——GitHub 限制单个 Release 资产 < 2 GiB，而带 CUDA 的便携包约 3 GB。
+
+1. 拿到 `VoxCPM2Studio-windows-x64.zip`（约 2.9 GB），**解压**到任意目录（建议路径不含空格、磁盘留 10 GB）。
    注意：要解压出来再运行，直接在压缩包里双击 exe 会失败。
 2. 双击解压出来的 `VoxCPM2Studio.exe`（`_internal` 文件夹必须和它在一起）。
    Windows 可能提示"未知发布者"，点「更多信息 → 仍要运行」（exe 未做代码签名）。
