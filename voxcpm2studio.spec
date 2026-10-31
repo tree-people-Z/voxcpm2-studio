@@ -20,7 +20,6 @@ datas += collect_data_files("voxcpm", include_py_files=False)
 
 hiddenimports = collect_submodules("voxcpm") + [
     "soundfile",
-    "modelscope",
     "PyQt6.QtSvg",
     "PyQt6.QtMultimedia",
 ]

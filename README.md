@@ -79,11 +79,7 @@ pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 python download_model.py
 ```
 
-或使用 ModelScope CLI（支持断点续传）：
-
-```bash
-modelscope download --model OpenBMB/VoxCPM2 --local_dir models/VoxCPM2
-```
+下载器只依赖标准库（走 ModelScope 文件 API + Range 断点续传），中断后重跑会接着下。
 
 模型默认放在 `models/VoxCPM2`，也可以在软件的「设置」里改成其它目录。
 （HuggingFace 无法直连时请走 ModelScope，本软件默认从本地目录加载，不联网。）

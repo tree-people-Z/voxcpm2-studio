@@ -1,6 +1,5 @@
 voxcpm>=2.0.3
 PyQt6>=6.5
-modelscope>=1.22.0
 soundfile
 numpy
 torch>=2.5.0
