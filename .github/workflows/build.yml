@@ -34,6 +34,10 @@ jobs:
       - name: 打包
         run: python -m PyInstaller voxcpm2studio.spec --noconfirm --log-level=WARN
 
+      - name: 附带使用说明（放在 exe 旁边）
+        shell: pwsh
+        run: Copy-Item "docs/便携版使用说明.txt" "dist/VoxCPM2Studio/使用说明.txt"
+
       - name: 压缩产物（7z 多线程，比 Compress-Archive 快约 9 倍）
         shell: pwsh
         run: |

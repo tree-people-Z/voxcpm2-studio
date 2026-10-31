@@ -19,7 +19,10 @@ python -c "import PyInstaller" 2>nul || python -m pip install pyinstaller || got
 echo [2/3] 打包（PyInstaller 单进程分析，主要耗时在扫描与复制；多核帮不上，别指望）...
 python -m PyInstaller voxcpm2studio.spec --noconfirm --log-level=WARN || goto :err
 
-echo [3/3] 完成
+echo [3/3] 附带说明文件
+copy /y "docs\便携版使用说明.txt" "dist\VoxCPM2Studio\使用说明.txt" >nul
+
+echo 完成
 for %%F in (dist\VoxCPM2Studio\VoxCPM2Studio.exe) do echo   exe: %%~fF
 
 if /i "%~1"=="zip" (
