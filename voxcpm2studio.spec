@@ -24,7 +24,7 @@ hiddenimports = collect_submodules("voxcpm") + [
     "PyQt6.QtMultimedia",
 ]
 
-# 明确排掉用不到的大件，能省几百 MB
+# 明确排掉用不到的大件：少扫一个包，打包就少几秒到几十秒
 excludes = [
     "tkinter",
     "matplotlib",
@@ -34,6 +34,21 @@ excludes = [
     "jupyter",
     "notebook",
     "pytest",
+    "tensorflow",
+    "keras",
+    "flax",
+    "jax",
+    "onnx",
+    "onnxruntime",
+    "torchvision",
+    "torch.testing",
+    "torch.utils.benchmark",
+    "torch.utils.tensorboard",
+    "torch.distributed",
+    "torchgen",
+    "torchaudio.models",
+    "torchaudio.pipelines",
+    "torchaudio.k2",
     "PyQt6.QtWebEngineCore",
     "PyQt6.QtWebEngineWidgets",
     "PyQt6.QtQuick",
@@ -54,6 +69,24 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
+# 只保留运行期需要的东西：头文件、导入库(.lib)、测试资源都不会被用到，
+# 去掉它们能明显缩短「复制二进制」这一步
+_DROP = ("/torch/include/", "/torch/test/", "/torchgen/", "/nvidia/include/")
+
+
+def _trim(entries):
+    kept = []
+    for item in entries:
+        dest = str(item[0]).replace("\\", "/").lower()
+        if dest.endswith(".lib") or any(d in dest for d in _DROP):
+            continue
+        kept.append(item)
+    return kept
+
+
+a.binaries = _trim(a.binaries)
+a.datas = _trim(a.datas)
 
 pyz = PYZ(a.pure)
 

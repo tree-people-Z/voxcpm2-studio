@@ -34,10 +34,11 @@ jobs:
       - name: 打包
         run: python -m PyInstaller voxcpm2studio.spec --noconfirm
 
-      - name: 压缩产物
+      - name: 压缩产物（7z 多线程，比 Compress-Archive 快 ~9 倍）
         shell: pwsh
         run: |
-          Compress-Archive -Path dist/VoxCPM2Studio/* -DestinationPath VoxCPM2Studio-windows-x64.zip -CompressionLevel Optimal
+          $sevenZip = "C:\Program Files-Zipz.exe"
+          & $sevenZip a -tzip -mx=1 -mmt=on -bso0 -bsp0 VoxCPM2Studio-windows-x64.zip .\dist\VoxCPM2Studio\*
           Get-Item VoxCPM2Studio-windows-x64.zip | Select-Object Name, @{n="SizeMB";e={[math]::Round($_.Length/1MB,1)}}
 
       - uses: actions/upload-artifact@v4
