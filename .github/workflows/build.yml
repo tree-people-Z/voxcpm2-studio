@@ -1,0 +1,53 @@
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖（CUDA 版 torch）
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 纯函数测试
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest tests -q
+
+      - name: 打包
+        run: python -m PyInstaller voxcpm2studio.spec --noconfirm
+
+      - name: 压缩产物
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/VoxCPM2Studio/* -DestinationPath VoxCPM2Studio-windows-x64.zip -CompressionLevel Optimal
+          Get-Item VoxCPM2Studio-windows-x64.zip | Select-Object Name, @{n="SizeMB";e={[math]::Round($_.Length/1MB,1)}}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoxCPM2Studio-windows-x64
+          path: VoxCPM2Studio-windows-x64.zip
+          retention-days: 14
+
+      - name: 打 tag 时自动发布 Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: VoxCPM2Studio-windows-x64.zip
+          generate_release_notes: true

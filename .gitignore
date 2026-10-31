@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# 本地数据（不进仓库）
+models/
+outputs/
+samples/
+config.json
+*.log
+.tmp/
+
+# 截图（docs/ 下的除外）
+shot_*.png
+!docs/screenshots/*.png
+
+# 打包产物
+build/
+dist/
+*.zip
