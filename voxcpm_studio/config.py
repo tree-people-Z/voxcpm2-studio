@@ -47,7 +47,7 @@ class AppConfig:
     last_reference_dir: str = ""
     # 本地 API（给其它程序 / AI 调用）
     api_enabled: bool = False
-    api_port: int = 8765
+    api_port: int = 7810
     api_token: str = ""            # 留空 = 只校验回环地址，不校验密钥
 
     # ---------------------------------------------------------------- #

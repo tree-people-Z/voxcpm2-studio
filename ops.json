@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "ops": [
+    {
+      "id": "audio.tts",
+      "title": "语音合成",
+      "summary": "文字转语音：可以凭空设计音色，也可以用一段参考音频克隆音色",
+      "inputs": {
+        "reference": {
+          "kind": "audio",
+          "label": "参考音频",
+          "required": false,
+          "accept": [
+            ".wav",
+            ".mp3",
+            ".flac",
+            ".m4a"
+          ],
+          "multiple": false
+        }
+      },
+      "outputs": {
+        "audio": {
+          "kind": "audio",
+          "label": "音频"
+        }
+      },
+      "params": {
+        "text": {
+          "type": "text",
+          "label": "文本",
+          "group": "basic",
+          "placeholder": "要合成的文字。句号=长停顿，逗号=短停顿，省略号=迟疑。",
+          "help": "长文本会自动分段合成再拼接，避免掉速与爆音。"
+        },
+        "mode": {
+          "type": "enum",
+          "label": "模式",
+          "group": "basic",
+          "default": "design",
+          "values": [
+            "design",
+            "clone",
+            "ultimate"
+          ],
+          "choices": [
+            {
+              "value": "design",
+              "label": "语音设计 · 只用描述造音色"
+            },
+            {
+              "value": "clone",
+              "label": "声音克隆 · 参考音频定音色"
+            },
+            {
+              "value": "ultimate",
+              "label": "极限克隆 · 参考音频 + 逐字文本"
+            }
+          ]
+        },
+        "control": {
+          "type": "string",
+          "label": "声音描述",
+          "group": "basic",
+          "default": "",
+          "placeholder": "年轻女性，温柔甜美，欢快带笑意",
+          "when": {
+            "param": "mode",
+            "in": [
+              "design",
+              "clone"
+            ]
+          },
+          "help": "会以「(描述)正文」的形式前置给模型。"
+        },
+        "prompt_text": {
+          "type": "string",
+          "label": "参考音频逐字文本",
+          "group": "basic",
+          "default": "",
+          "when": {
+            "param": "mode",
+            "eq": "ultimate"
+          },
+          "help": "必须是参考音频里逐字对应的文本。"
+        },
+        "cfg_value": {
+          "type": "float",
+          "label": "CFG 强度",
+          "group": "advanced",
+          "default": 3.0,
+          "min": 1,
+          "max": 3,
+          "step": 0.1,
+          "help": "官方区间 1.0–3.0。长文本发虚或有杂音时降到 1.5–2.0。"
+        },
+        "inference_timesteps": {
+          "type": "int",
+          "label": "扩散步数",
+          "group": "advanced",
+          "default": 30,
+          "min": 4,
+          "max": 30,
+          "step": 1,
+          "help": "越高越稳越慢。30 → 10 大约快 2.2 倍。"
+        },
+        "normalize": {
+          "type": "bool",
+          "label": "文本正则化",
+          "group": "advanced",
+          "default": false,
+          "help": "数字、日期不勾可能被逐位朗读。"
+        },
+        "retry_badcase": {
+          "type": "bool",
+          "label": "异常重试",
+          "group": "advanced",
+          "default": false,
+          "help": "勾上会改走一次性生成（不流式）。"
+        },
+        "split_chars": {
+          "type": "int",
+          "label": "分段长度",
+          "group": "advanced",
+          "default": 0,
+          "min": 0,
+          "max": 500,
+          "step": 10,
+          "unit": "字",
+          "help": "0 = 按标点自动分段。"
+        }
+      },
+      "long_running": true,
+      "estimate": {
+        "fixed_sec": 8
+      }
+    }
+  ]
+}

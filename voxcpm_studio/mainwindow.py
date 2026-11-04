@@ -129,7 +129,7 @@ class SettingsDialog(QDialog):
         self.api_check.setToolTip("默认只监听 127.0.0.1，接口说明见 GET /help")
         self.api_port = QSpinBox()
         self.api_port.setRange(1024, 65535)
-        self.api_port.setValue(getattr(cfg, "api_port", 8765))
+        self.api_port.setValue(getattr(cfg, "api_port", 7810))
         self.api_port.setFixedWidth(96)
         self.api_port.setToolTip("端口被占用时换一个（1024–65535）")
         api_row = QHBoxLayout()
@@ -807,7 +807,7 @@ class MainWindow(QMainWindow):
                 self.api_server = None
             return
 
-        port = int(getattr(self.cfg, "api_port", 8765))
+        port = int(getattr(self.cfg, "api_port", 7810))
         if self.api_server is not None and self.api_server.running:
             if self.api_server.port == port:
                 return
@@ -827,7 +827,11 @@ class MainWindow(QMainWindow):
         try:
             server.start()
         except OSError as exc:
-            self.log(f"本地 API 启动失败（端口 {port}）：{exc}")
+            self.log(
+                f"本地 API 启动失败（端口 {port}）：{exc}\n"
+                f"  端口已被占用 —— 大概率是 start-api.bat 起的无界面服务还在跑。\n"
+                f"  两者同时使用会各加载一份模型（约 7.9 GB × 2），请先关掉其中一个。"
+            )
             return
         self.api_server = server
 

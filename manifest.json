@@ -1,0 +1,30 @@
+{
+  "manifest_version": 1,
+  "kind": "module",
+  "id": "tts-voxcpm2",
+  "name": "VoxCPM2 语音合成",
+  "version": "1.0.0",
+  "description": "本地中文 TTS：语音设计 / 声音克隆 / 极限克隆。界面是 PyQt 桌面程序；对外提供 /api/*，可被 Tree 或脚本调用。",
+  "platform": [
+    "win-x64"
+  ],
+  "min_hub_version": "0.1.0",
+  "port": 7810,
+  "launch": [
+    "{python}",
+    "-X",
+    "utf8",
+    "server/main.py"
+  ],
+  "startup_timeout_sec": 120,
+  "requirements": {
+    "gpu": {
+      "required": true,
+      "vram_mb": 7500,
+      "exclusive": true
+    },
+    "disk_mb": 6000
+  },
+  "ops": "ops.json",
+  "ui": "none"
+}

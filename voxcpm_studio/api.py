@@ -16,6 +16,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import sys
 import threading
 import time
 import uuid
@@ -24,7 +25,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import numpy as np
 
@@ -40,6 +41,30 @@ PARAM_RANGES = {
 }
 
 MODES = ("design", "clone", "ultimate")
+KNOWN_PARAMS = ("cfg_value", "inference_timesteps", "max_len", "min_len",
+                "normalize", "denoise", "retry_badcase", "split_chars")
+
+# ---- API 规范层（见 Tree/docs/module-api-spec.md）---- #
+API_VERSION = 1
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024   # 上传上限，防止把磁盘写满
+
+
+def _pkg_root() -> Path:
+    """仓库根目录；打包后变成 _internal（ops.json 由 spec 作为数据文件带进去）。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parents[1]
+
+
+PKG_ROOT = _pkg_root()
+STATE_MAP = {
+    "queued": "queued",
+    "running": "running",
+    "canceling": "canceling",
+    "done": "succeeded",
+    "error": "failed",
+    "canceled": "canceled",
+}
 
 
 # ==================================================================== #
@@ -60,6 +85,52 @@ class Job:
     elapsed: float = 0.0
     cancel: threading.Event = field(default_factory=threading.Event)
     done: threading.Event = field(default_factory=threading.Event)
+    # ---- 规范层字段 ----
+    op: str = "audio.tts"
+    pct: float = 0.0
+    stage: str = "排队中"
+    detail: str = ""
+    started: float | None = None
+    ended: float | None = None
+    inputs: dict[str, Any] = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict)
+    gen_params: GenerationParams | None = None
+    error_payload: dict[str, Any] | None = None
+
+    def error_code(self) -> str:
+        """失败任务要报出真实原因（bad_params / missing_reference …），不能一律 internal。"""
+        err = (self.error_payload or {}).get("error")
+        if isinstance(err, dict):
+            return str(err.get("code") or "internal")
+        if err:
+            return str(err)
+        return "internal"
+
+    def api(self) -> dict[str, Any]:
+        """规范层任务形状：state / progress{pct,stage,detail} / outputs。"""
+        outputs = {"audio": Path(self.path).name} if self.path else None
+        error = None
+        if self.status == "error":
+            error = {"code": self.error_code(), "message": self.error or "生成失败"}
+        elif self.status == "canceled":
+            error = {"code": "canceled", "message": "任务已取消"}
+        return {
+            "id": self.id,
+            "op": self.op,
+            "state": STATE_MAP.get(self.status, self.status),
+            "progress": {
+                "pct": round(float(self.pct or 0.0), 4),
+                "stage": self.stage,
+                "detail": self.detail,
+            },
+            "inputs": self.inputs,
+            "params": self.params,
+            "outputs": outputs,
+            "error": error,
+            "created_at": self.created,
+            "started_at": self.started,
+            "ended_at": self.ended,
+        }
 
     def public(self) -> dict[str, Any]:
         return {
@@ -80,7 +151,13 @@ class ApiError(Exception):
     def __init__(self, status: int, code: str, message: str, **extra: Any) -> None:
         super().__init__(message)
         self.status = status
-        self.payload = {"ok": False, "error": code, "message": message, **extra}
+        # 规范层的错误形状：{ok:false, error:{code, message, field}}
+        # 顶层仍然保留 message，老客户端读 body["message"] 不会断。
+        err: dict[str, Any] = {"code": code, "message": message}
+        field = extra.pop("field", None)
+        if field:
+            err["field"] = field
+        self.payload = {"ok": False, "error": err, "message": message, **extra}
 
 
 # ==================================================================== #
@@ -93,7 +170,7 @@ class ApiServer:
         self,
         engine: TTSEngine,
         host: str = "127.0.0.1",
-        port: int = 8765,
+        port: int = 7810,
         token: str = "",
         output_dir: str | Path = "outputs",
         log=None,
@@ -113,6 +190,9 @@ class ApiServer:
         self._gen_lock = threading.Lock()
         self._jobs: dict[str, Job] = {}
         self._jobs_lock = threading.Lock()
+        # 独立运行时由 server/main.py 设置：模型没加载就先自动加载
+        self.ensure_loaded: Callable[[], None] | None = None
+        self.upload_dir = Path(output_dir).parent / "work" / "uploads"
 
     # ------------------------------------------------------------ #
     @property
@@ -154,12 +234,15 @@ class ApiServer:
     def submit(self, payload: dict[str, Any], background: bool) -> Job:
         text = str(payload.get("text") or "").strip()
         if not text:
-            raise ApiError(400, "missing_text", "text 不能为空")
+            raise ApiError(400, "missing_text", "文本不能为空", field="text")
         mode = str(payload.get("mode") or "design")
         if mode not in MODES:
-            raise ApiError(400, "bad_mode", f"mode 必须是 {'/'.join(MODES)}")
+            raise ApiError(400, "bad_mode", f"mode 必须是 {'/'.join(MODES)}", field="mode")
+        # 参数在提交时就校验：越界 / 拼错立刻 400，不要变成一条失败任务
+        gen_params = _params_from(payload, self.engine)
 
         job = Job(id=uuid.uuid4().hex[:12], text=text, mode=mode)
+        job.gen_params = gen_params
         with self._jobs_lock:
             self._jobs[job.id] = job
             # 只保留最近 50 个任务记录
@@ -189,24 +272,30 @@ class ApiServer:
 
     def _run_job(self, job: Job, payload: dict[str, Any]) -> None:
         try:
-            if not self.engine.is_loaded:
-                raise ApiError(
-                    503,
-                    "model_not_loaded",
-                    "模型尚未加载：请先在 VoxCPM2 Studio 界面里点「加载模型」",
-                )
             if self.is_busy():
                 raise ApiError(
                     409, "busy", "界面正在生成，请等它结束或先点「停止合成」"
                 )
-            if not self._gen_lock.acquire(timeout=0.2):
-                raise ApiError(
-                    409,
-                    "busy",
-                    "已有生成任务在进行，请稍后重试或先取消当前任务",
-                )
+            # 单 GPU：后来的任务排队等锁，而不是直接拒绝。
+            # 等待期间每 0.2s 检查一次取消，排队中的任务也能被取消。
+            while not self._gen_lock.acquire(timeout=0.2):
+                if job.cancel.is_set():
+                    raise GenerationCancelled(0.0)
+                job.stage = "排队中"
             try:
+                # 加载模型必须在锁内：否则并发提交会同时加载三份，直接撑爆显存。
+                if not self.engine.is_loaded:
+                    if self.ensure_loaded is not None:
+                        job.stage = "加载模型"
+                        self.ensure_loaded()
+                    if not self.engine.is_loaded:
+                        raise ApiError(
+                            503, "model_missing",
+                            "模型尚未加载：独立运行时请检查 models/VoxCPM2 是否存在",
+                        )
                 job.status = "running"
+                job.started = time.time()
+                job.stage = "加载模型" if not self.engine.is_loaded else "开始合成"
                 self._generate(job, payload)
             finally:
                 self._gen_lock.release()
@@ -214,7 +303,7 @@ class ApiServer:
             job.status = "error"
             job.error = exc.payload.get("message", str(exc))
             job.error_status = exc.status
-            job.error_payload = exc.payload  # type: ignore[attr-defined]
+            job.error_payload = exc.payload
         except GenerationCancelled as exc:
             job.status = "canceled"
             job.audio_seconds = exc.produced_seconds
@@ -223,11 +312,12 @@ class ApiServer:
             job.status = "error"
             job.error = f"{type(exc).__name__}: {exc}"
         finally:
+            job.ended = time.time()
             job.done.set()
 
     def _generate(self, job: Job, payload: dict[str, Any]) -> None:
         mode = job.mode
-        params = _params_from(payload, self.engine)
+        params = job.gen_params or _params_from(payload, self.engine)
 
         control = payload.get("control")
         if not control and isinstance(payload.get("tags"), dict):
@@ -255,9 +345,7 @@ class ApiServer:
             reference_wav=reference_path if mode in ("clone", "ultimate") else None,
             params=params,
             should_stop=job.cancel.is_set,
-            on_progress=lambda seg, total, secs: job.progress.update(
-                {"segment": seg, "segments": total, "audio_seconds": round(secs, 2)}
-            ),
+            on_progress=lambda seg, total, secs: _on_progress(job, seg, total, secs),
         )
         job.audio_seconds = result.audio_seconds
         job.elapsed = time.time() - t0
@@ -272,6 +360,75 @@ class ApiServer:
     # ------------------------------------------------------------ #
     # 序列化辅助
     # ------------------------------------------------------------ #
+    def ops(self) -> list[dict[str, Any]]:
+        """能力声明来自 ops.json（唯一真源，界面和 Tree 都读它）。"""
+        path = PKG_ROOT / "ops.json"
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))["ops"]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def output_name(self, job: Job) -> str | None:
+        return Path(job.path).name if job.path else None
+
+    def list_outputs(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        if not self.output_dir.exists():
+            return rows
+        for p in self.output_dir.iterdir():
+            if not p.is_file():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            rows.append({"name": p.name, "size": st.st_size, "mtime": st.st_mtime,
+                         "kind": "audio" if p.suffix.lower() in (".wav", ".mp3", ".flac") else "file"})
+        rows.sort(key=lambda r: r["mtime"], reverse=True)
+        return rows
+
+    def cancel_all(self) -> int:
+        n = 0
+        for job in list(self._jobs.values()):
+            if job.status in ("queued", "running"):
+                try:
+                    self.cancel_job(job.id)
+                    n += 1
+                except ApiError:
+                    pass
+        return n
+
+    def unload(self) -> dict[str, Any]:
+        # 必须拿到生成锁再卸：只查 busy 存在竞态窗口，任务可能刚好在检查之后启动，
+        # 模型被卸掉后正在跑的那次生成会直接崩在 CUDA 上。
+        if not self._gen_lock.acquire(timeout=0.2):
+            raise ApiError(429, "busy", "还有任务在跑，不能卸载")
+        try:
+            if self.is_busy():
+                raise ApiError(429, "busy", "界面正在生成，不能卸载")
+            before = _vram_used_mb()
+            try:
+                self.engine.unload()
+            except Exception:  # noqa: BLE001
+                pass
+            after = _vram_used_mb()
+        finally:
+            self._gen_lock.release()
+        return {"freed_mb": max(0, int((before or 0) - (after or 0)))}
+
+    def api_state(self) -> dict[str, Any]:
+        jobs = sorted(self._jobs.values(), key=lambda j: j.created, reverse=True)[:50]
+        return {
+            "ok": True,
+            "api_version": API_VERSION,
+            "version": __version__,
+            "ops": self.ops(),
+            "jobs": [j.api() for j in jobs],
+            "outputs": self.list_outputs()[:50],
+            "output_dir": str(self.output_dir),
+            "health": self.health(),
+        }
+
     def wav_bytes(self, job: Job) -> bytes:
         if not job.path:
             raise ApiError(404, "no_audio", "该任务还没有音频")
@@ -292,10 +449,39 @@ class ApiServer:
         }
 
 
+def _on_progress(job: Job, segment: int, total: int, seconds: float) -> None:
+    """把引擎的（第几段/共几段/已生成秒数）翻成规范层的 pct/stage/detail。
+
+    两条硬规则：pct 只增不减；单段时 pct 停住，靠 stage/detail 给反馈。
+    """
+    total = max(1, int(total))
+    pct = 0.05 + 0.9 * ((max(1, int(segment)) - 1) / total)
+    job.pct = max(job.pct, min(0.95, pct))
+    job.stage = f"第 {segment}/{total} 段"
+    job.detail = f"已生成 {seconds:.1f}s"
+    job.progress.update({"segment": segment, "segments": total,
+                         "audio_seconds": round(seconds, 2)})
+
+
+def _vram_used_mb() -> int:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return int(torch.cuda.memory_reserved() / 1024 / 1024)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
 def _params_from(payload: dict[str, Any], engine: TTSEngine) -> GenerationParams:
     raw = payload.get("params") or {}
     if not isinstance(raw, dict):
         raise ApiError(400, "bad_params", "params 必须是对象")
+    unknown = set(raw) - set(KNOWN_PARAMS)
+    if unknown:
+        first = sorted(unknown)[0]
+        raise ApiError(400, "bad_params", f"不接受参数：{', '.join(sorted(unknown))}",
+                       field=first)
     p = GenerationParams()
     if payload.get("stream"):
         # 官方：流式下 retry_badcase 会被强制关闭；换来的是取消能在下一个音频块生效
@@ -317,6 +503,8 @@ def _params_from(payload: dict[str, Any], engine: TTSEngine) -> GenerationParams
             setattr(p, key, bool(raw[key]))
     if "split_chars" in payload:
         p.split_chars = int(payload["split_chars"] or 0)
+    elif "split_chars" in raw:
+        p.split_chars = int(raw["split_chars"] or 0)
     return p
 
 
@@ -402,6 +590,201 @@ def _make_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 return True
             return self.headers.get("X-API-Key", "") == server.token
 
+        # ---------------- /api 规范层 ---------------- #
+        def _is_api(self) -> bool:
+            return urlparse(self.path).path.startswith("/api/")
+
+        def _api(self, method: str) -> None:
+            path = urlparse(self.path).path.rstrip("/") or "/api"
+            segs = [unquote(s) for s in path.split("/") if s]     # ["api", ...]
+            try:
+                if method == "GET":
+                    self._api_get(segs)
+                elif method == "POST":
+                    self._api_post(segs)
+                elif method == "DELETE":
+                    self._api_delete(segs)
+                else:
+                    raise ApiError(405, "method_not_allowed", f"不支持 {method}")
+            except ApiError as exc:
+                self._error(exc)
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"ok": False,
+                                 "error": {"code": "internal", "message": str(exc)}})
+
+        def _api_get(self, segs: list[str]) -> None:
+            if segs == ["api", "health"]:
+                body = server.health()
+                body.update({"module": "voxcpm2-studio", "api_version": API_VERSION,
+                             "version": __version__,
+                             "state": "ready" if body.get("model_loaded") else "starting",
+                             "gpu": _gpu_info(server)})
+                self._json(200, body)
+                return
+            if segs == ["api", "ops"]:
+                self._json(200, {"ok": True, "ops": server.ops()})
+                return
+            if segs == ["api", "state"]:
+                self._json(200, server.api_state())
+                return
+            if segs == ["api", "jobs"]:
+                with server._jobs_lock:
+                    items = sorted(server._jobs.values(), key=lambda j: j.created, reverse=True)
+                self._json(200, {"ok": True, "jobs": [j.api() for j in items]})
+                return
+            if len(segs) == 3 and segs[:2] == ["api", "jobs"]:
+                self._json(200, {"ok": True, "job": server.get_job(segs[2]).api()})
+                return
+            if segs == ["api", "outputs"]:
+                self._json(200, {"ok": True, "outputs": server.list_outputs()})
+                return
+            if len(segs) >= 3 and segs[:2] == ["api", "outputs"]:
+                self._send_output("/".join(segs[2:]))
+                return
+            raise ApiError(404, "not_found", f"没有这个接口：{'/'.join(segs)}")
+
+        def _api_post(self, segs: list[str]) -> None:
+            if segs == ["api", "jobs"]:
+                body = self._body()
+                op_id = str(body.get("op") or "audio.tts")
+                if op_id != "audio.tts":
+                    raise ApiError(404, "unknown_op", f"没有这个能力：{op_id}")
+
+                params = dict(body.get("params") or {})
+                inputs = dict(body.get("inputs") or {})
+                # 拼错的参数必须报错，不能静默丢掉（否则用户以为生效了）
+                allowed = set(KNOWN_PARAMS) | {"text", "mode", "control", "prompt_text"}
+                unknown = set(params) - allowed
+                if unknown:
+                    first = sorted(unknown)[0]
+                    raise ApiError(400, "bad_params",
+                                   f"不接受参数：{', '.join(sorted(unknown))}", field=first)
+                mode = str(params.get("mode") or "design")
+                if mode not in MODES:
+                    raise ApiError(400, "bad_param", f"mode 必须是 {'/'.join(MODES)}",
+                                   field="mode")
+                reference = inputs.get("reference")
+                if mode in ("clone", "ultimate") and not reference:
+                    raise ApiError(400, "missing_input",
+                                   f"{mode} 模式需要参考音频", field="reference")
+                if mode == "ultimate" and not str(params.get("prompt_text") or "").strip():
+                    raise ApiError(400, "bad_param", "极限克隆需要参考音频的逐字文本",
+                                   field="prompt_text")
+
+                payload = {
+                    "text": params.get("text") or "",
+                    "mode": mode,
+                    "control": params.get("control") or "",
+                    "prompt_text": params.get("prompt_text") or "",
+                    "params": {k: v for k, v in params.items()
+                               if k in ("cfg_value", "inference_timesteps", "max_len",
+                                        "min_len", "normalize", "denoise",
+                                        "retry_badcase", "split_chars")},
+                }
+                if reference:
+                    payload["reference_audio"] = {"path": str(reference)}
+
+                job = server.submit(payload, background=True)
+                job.inputs = {k: str(v) for k, v in inputs.items()}
+                job.params = dict(params)
+                self._json(202, {"ok": True, "job": job.api()})
+                return
+
+            if segs == ["api", "upload"]:
+                query = urlparse(self.path).query
+                name = ""
+                for part in query.split("&"):
+                    if part.startswith("name="):
+                        name = unquote(part[5:])
+                if not name:
+                    raise ApiError(400, "bad_param", "缺少 name 参数", field="name")
+                safe = Path(name).name or "upload.wav"
+                slot = server.upload_dir / f"{int(time.time() * 1000)}"
+                slot.mkdir(parents=True, exist_ok=True)
+                target = slot / safe
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    raise ApiError(400, "bad_json", "Content-Length 不是数字") from None
+                if length <= 0:
+                    raise ApiError(400, "bad_json", "请求体为空")
+                if length > MAX_UPLOAD_BYTES:
+                    raise ApiError(413, "too_large",
+                                   f"上传超过 {MAX_UPLOAD_BYTES // 1024 // 1024} MB 上限")
+                remaining = length
+                with target.open("wb") as fh:
+                    while remaining > 0:
+                        chunk = self.rfile.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                        remaining -= len(chunk)
+                self._json(200, {"ok": True, "token": str(target),
+                                 "path": str(target), "name": safe})
+                return
+
+            if segs == ["api", "unload"]:
+                self._json(200, {"ok": True, **server.unload()})
+                return
+            if segs == ["api", "cancel-all"]:
+                self._json(200, {"ok": True, "canceled": server.cancel_all()})
+                return
+            if segs == ["api", "shutdown"]:
+                self._json(200, {"ok": True})
+                threading.Thread(target=server.stop, daemon=True).start()
+                return
+            raise ApiError(404, "not_found", f"没有这个接口：{'/'.join(segs)}")
+
+        def _api_delete(self, segs: list[str]) -> None:
+            if len(segs) == 3 and segs[:2] == ["api", "jobs"]:
+                job = server.cancel_job(segs[2])
+                self._json(200, {"ok": True, "job": job.api()})
+                return
+            raise ApiError(404, "not_found", f"没有这个接口：{'/'.join(segs)}")
+
+        def _send_output(self, name: str) -> None:
+            target = (server.output_dir / name).resolve()
+            try:
+                target.relative_to(server.output_dir.resolve())
+            except ValueError:
+                raise ApiError(404, "missing_output", "没有这个产物") from None
+            if not target.is_file():
+                raise ApiError(404, "missing_output", "没有这个产物")
+
+            size = target.stat().st_size
+            ctype = "audio/wav" if target.suffix.lower() == ".wav" else "application/octet-stream"
+            rng = self.headers.get("Range")
+            start, end = 0, size - 1
+            partial = False
+            if rng and rng.startswith("bytes="):
+                a, _, b = rng[6:].partition("-")
+                try:
+                    start = int(a) if a else 0
+                    end = int(b) if b else size - 1
+                except ValueError:
+                    start, end = 0, size - 1
+                # 越界 / 反着写的 Range 一律夹到合法区间，否则会算出负数长度
+                start = max(0, min(start, size - 1))
+                end = max(start, min(end, size - 1))
+                partial = True
+
+            self.send_response(206 if partial else 200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(max(0, end - start + 1)))
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            with target.open("rb") as fh:
+                fh.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = fh.read(min(256 * 1024, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+
         # ---------------- 路由 ---------------- #
         def do_OPTIONS(self) -> None:  # noqa: N802
             self._send(204, b"", "text/plain")
@@ -410,24 +793,37 @@ def _make_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
             try:
                 if not self._auth_ok():
                     raise ApiError(401, "unauthorized", "需要 X-API-Key")
+                if self._is_api():
+                    self._api("GET")
+                    return
                 self._route_get()
             except ApiError as exc:
                 self._error(exc)
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"ok": False,
+                                 "error": {"code": "internal", "message": str(exc)}})
 
         def do_POST(self) -> None:  # noqa: N802
             try:
                 if not self._auth_ok():
                     raise ApiError(401, "unauthorized", "需要 X-API-Key")
+                if self._is_api():
+                    self._api("POST")
+                    return
                 self._route_post()
             except ApiError as exc:
                 self._error(exc)
             except Exception as exc:  # noqa: BLE001
-                self._json(500, {"ok": False, "error": "internal", "message": str(exc)})
+                self._json(500, {"ok": False,
+                                 "error": {"code": "internal", "message": str(exc)}})
 
         def do_DELETE(self) -> None:  # noqa: N802
             try:
                 if not self._auth_ok():
                     raise ApiError(401, "unauthorized", "需要 X-API-Key")
+                if self._is_api():
+                    self._api("DELETE")
+                    return
                 parts = [p for p in urlparse(self.path).path.split("/") if p]
                 if len(parts) == 2 and parts[0] == "jobs":
                     job = server.cancel_job(parts[1])
@@ -436,6 +832,9 @@ def _make_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 raise ApiError(404, "not_found", "没有这个接口")
             except ApiError as exc:
                 self._error(exc)
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"ok": False,
+                                 "error": {"code": "internal", "message": str(exc)}})
 
         def _route_get(self) -> None:
             path = urlparse(self.path).path.rstrip("/") or "/"
@@ -521,11 +920,13 @@ def _make_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
                 if extra:
                     self._json(job.error_status, extra)   # 保留 409/400/503 等语义
                 else:
-                    self._json(500, {"ok": False, "error": "generation_failed",
-                                     "message": job.error})
+                    self._json(500, {"ok": False,
+                                     "error": {"code": "generation_failed",
+                                               "message": job.error}})
                 return
             if job.status == "canceled":
-                self._json(409, {"ok": False, "error": "canceled",
+                self._json(409, {"ok": False,
+                                 "error": {"code": "canceled", "message": "任务已取消"},
                                  "job": job.public()})
                 return
             fmt = str(payload.get("response_format") or payload.get("format") or "json")
@@ -547,8 +948,33 @@ def _make_handler(server: ApiServer) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
+def _gpu_info(server: ApiServer) -> dict[str, Any]:
+    info: dict[str, Any] = {"name": None, "vram_total_mb": None, "vram_used_mb": None}
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            info["name"] = torch.cuda.get_device_name(0)
+            info["vram_total_mb"] = int(total / 1024 / 1024)
+            info["vram_used_mb"] = int((total - free) / 1024 / 1024)
+    except Exception:  # noqa: BLE001
+        pass
+    return info
+
+
 ENDPOINTS = {
-    "GET /help": "接口列表",
+    "GET /api/health": "就绪/忙闲/显存（规范层）",
+    "GET /api/ops": "能力声明（来自 ops.json）",
+    "GET /api/state": "一次拿全：ops + 任务 + 产物",
+    "POST /api/jobs": "提交合成任务 {op, params, inputs} → 202",
+    "GET /api/jobs/{id}": "任务状态与进度",
+    "DELETE /api/jobs/{id}": "取消任务",
+    "GET /api/outputs/{name}": "产物下载（支持 Range）",
+    "POST /api/upload?name=x.wav": "上传文件（原始字节）",
+    "POST /api/unload": "释放显存",
+    "POST /api/cancel-all": "取消所有任务",
+    "POST /api/shutdown": "停止服务",
+    "GET /help": "接口列表（旧）",
     "GET /health": "模型/显存/忙闲状态；模型未加载返回 503",
     "GET /presets": "标签维度库（design / clone）与常用组合",
     "GET /params": "参数默认值与官方推荐区间",

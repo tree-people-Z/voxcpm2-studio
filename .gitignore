@@ -9,8 +9,10 @@ models/
 outputs/
 samples/
 config.json
+work/
 *.log
 .tmp/
+*.bak
 
 # 截图（docs/ 下的除外）
 shot_*.png

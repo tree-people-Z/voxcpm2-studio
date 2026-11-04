@@ -15,6 +15,8 @@ ROOT = Path(SPECPATH).resolve()
 ASSETS = ROOT / "voxcpm_studio" / "assets"
 
 datas = [(str(ASSETS), "voxcpm_studio/assets")]
+# 能力声明是运行时读的文件（/api/ops、/api/state），不打进去的话打包版返回空列表
+datas += [(str(ROOT / "ops.json"), ".")]
 # voxcpm 的 tokenizer 脚本 / 配置在包里是数据文件，要带上
 datas += collect_data_files("voxcpm", include_py_files=False)
 
