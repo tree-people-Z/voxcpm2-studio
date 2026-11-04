@@ -1,5 +1,7 @@
 # VoxCPM2 Studio
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/tree-people-z/voxcpm2-studio)](https://m8ven.ai/mcp/tree-people-z/voxcpm2-studio?s=readme)
+
 基于 **VoxCPM2**（OpenBMB，2B，tokenizer-free TTS）的本地语音合成桌面软件，PyQt6 图形界面，Windows 开箱即用。
 
 > **只想用、不想配环境？** 打包成便携版：`build.bat`（或从 GitHub Actions 下载构建产物），解压后双击
@@ -155,7 +157,7 @@ voxcpm_studio/
   icons.py                  SVG 图标加载 + 按语义色着色
   theme.py                  主题 token + QSS 生成器（浅色 / 深色两套，同一套尺度）
   presets.py                声音描述标签库（按维度组织，可自由组合）
-  api.py                    本地 HTTP API（标准库实现，与界面共用引擎）
+  api.py                    本地 HTTP API（标准库实现，与界面共用引擎；/api/* 规范层）
   downloader.py             模型下载（ModelScope 文件 API + Range 断点续传）
   model_setup.py            首次启动的「下载 / 指定本地目录 / 稍后」对话框
   assets/icons/*.svg        线性图标（24×24，1.8px 描边，可着色）
@@ -172,7 +174,12 @@ tools/
   mcp_client.py             极简 MCP stdio 客户端，便于命令行调试 OpenDesign 工具
 voxcpm2studio.spec          PyInstaller 打包配置（onedir，不含模型）
 build.bat                   一键打包
+start-api.bat               只跑 API 不开界面（无头模式，供 Tree / 脚本调用）
+server/main.py              无头服务入口（自动加载模型 + 空闲卸载显存）
+manifest.json               模块清单（Tree 聚合用：端口 / 启动方式 / 显存需求）
+ops.json                    能力声明（/api/ops 与 /api/state 的唯一真源）
 tests/test_core.py          纯函数测试（切分 / 描述组合 / 配置往返 / API 参数校验）
+tests/test_api_http.py      HTTP 层测试（真起服务：路由 / 错误形状 / 任务状态机 / Range 下载）
 .github/workflows/          CI：pytest + Windows 打包产物
 docs/ROADMAP.md             优化路线与验收标准
 docs/screenshots/           界面截图（README 预览图）
@@ -211,20 +218,45 @@ build.bat                        # 打包成 dist\VoxCPM2Studio\VoxCPM2Studio.ex
 
 ## 本地 API（给程序和 AI 调用）
 
-设置 → 勾选「启用本地 API」并选端口（默认 **8765**），保存后立即生效；只监听 `127.0.0.1`，
+设置 → 勾选「启用本地 API」并选端口（默认 **7810**），保存后立即生效；只监听 `127.0.0.1`，
 `GET /help` 就是接口清单。生成任务串行执行，界面正在生成时 API 返回 `409 busy`。
 
+只想跑 API、不要界面：双击 `start-api.bat`（或 `python server\main.py`），模型第一次提交任务时自动加载，
+空闲 5 分钟自动释放显存（`VOXCPM_IDLE_UNLOAD_SEC` 可调，0 = 不释放）。
+
 ```bash
-curl -s http://127.0.0.1:8765/health          # 模型/显存/忙闲
-curl -s http://127.0.0.1:8765/presets         # 标签维度库
-curl -s http://127.0.0.1:8765/params          # 默认值 + 官方推荐区间
+curl -s http://127.0.0.1:7810/api/health       # 就绪/忙闲/显存（规范层）
+curl -s http://127.0.0.1:7810/api/state        # 一次拿全：能力 + 任务 + 产物
+curl -s http://127.0.0.1:7810/presets          # 标签维度库
+curl -s http://127.0.0.1:7810/params           # 默认值 + 官方推荐区间
 
 # 用标签组合描述音色，直接拿 wav
-curl -s -X POST http://127.0.0.1:8765/synthesize   -H "Content-Type: application/json"   -d '{"text":"你好，这是接口合成的语音。","mode":"design",
+curl -s -X POST http://127.0.0.1:7810/synthesize   -H "Content-Type: application/json"   -d '{"text":"你好，这是接口合成的语音。","mode":"design",
        "tags":{"性别年龄":"年轻女性","音色":"温柔甜美","情绪":"轻快带笑"},
        "params":{"inference_timesteps":8},
        "response_format":"wav"}' -o out.wav
 ```
+
+两套接口都在（老路径保持不变，`/api/*` 是给 Tree 这类宿主用的规范层）：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /api/health` | 就绪状态、显存、忙闲；`state` 为 `ready` / `starting` |
+| `GET /api/state` | 一次拿全：`ops` + 最近 50 个任务 + 产物列表 |
+| `GET /api/ops` | 能力声明，唯一真源是仓库根目录的 `ops.json` |
+| `POST /api/jobs` | 提交任务 `{op:"audio.tts", params:{...}, inputs:{reference}}` → `202` |
+| `GET /api/jobs/{id}` | `state` / `progress{pct,stage,detail}` / `outputs` / `error{code,message}` |
+| `DELETE /api/jobs/{id}` | 取消任务（排队中的也能取消） |
+| `GET /api/outputs/{name}` | 下载产物，支持 `Range`（边下边播） |
+| `POST /api/upload?name=x.wav` | 上传参考音频（原始字节），返回本地路径 |
+| `POST /api/unload` | 释放显存（有任务在跑时返回 `429 busy`，不会抢锁） |
+| `POST /api/cancel-all` | 取消所有未完成任务 |
+| `POST /api/shutdown` | 停止服务 |
+
+错误体统一是 `{"ok":false,"error":{"code","message","field"?}}`，顶层另留一份 `message` 给老客户端：
+参数拼错（`cfgg_value`）当场 `400 bad_params` + `field`，而不是变成一条失败任务。
+
+### 老接口（界面里的开关起的是同一个服务）
 
 | 端点 | 说明 |
 |---|---|
@@ -250,7 +282,7 @@ curl -s -X POST http://127.0.0.1:8765/synthesize   -H "Content-Type: application
     "voxcpm2-tts": {
       "command": "python",
       "args": ["C:/Users/<你>/Desktop/TTS/tools/tts_mcp_server.py"],
-      "env": { "TTS_API_URL": "http://127.0.0.1:8765" }
+      "env": { "TTS_API_URL": "http://127.0.0.1:7810" }
     }
   }
 }
@@ -304,7 +336,7 @@ PyTorch 的 JIT 编译器，把逐算子执行合成融合 kernel，官方默认
 右上角「设置」→ 修改后需重新加载模型。
 
 **其它程序调不通 API**
-先确认「设置 → 本地 API」已勾选并保存（日志里会打印 `本地 API 已启动：http://127.0.0.1:8765`）；
+先确认「设置 → 本地 API」已勾选并保存（日志里会打印 `本地 API 已启动：http://127.0.0.1:7810`）；
 端口被占用时换一个；跨机器访问需自行改 `host` 并注意没有鉴权时的暴露风险。
 
 **想换主题**
