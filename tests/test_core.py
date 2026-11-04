@@ -165,7 +165,7 @@ def test_api_params_reject_out_of_range(bad):
     with pytest.raises(ApiError) as exc:
         _params_from({"params": bad}, None)
     assert exc.value.status == 400
-    assert exc.value.payload["error"] == "bad_params"
+    assert exc.value.payload["error"]["code"] == "bad_params"
 
 
 def test_api_stream_flag_disables_retry():
