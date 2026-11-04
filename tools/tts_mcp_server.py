@@ -1,7 +1,7 @@
 """TTS MCP 服务器（stdio）：把 VoxCPM2 Studio 的本地 API 包装成 MCP 工具。
 
 给 Claude Code / Codex / pi 这类 agent 直接调用：
-    python tools/tts_mcp_server.py                # 默认连 http://127.0.0.1:8765
+    python tools/tts_mcp_server.py                # 默认连 http://127.0.0.1:7810
     TTS_API_URL=http://127.0.0.1:8800 python tools/tts_mcp_server.py
     TTS_API_KEY=xxx python tools/tts_mcp_server.py
 
@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-API_URL = os.environ.get("TTS_API_URL", "http://127.0.0.1:8765").rstrip("/")
+API_URL = os.environ.get("TTS_API_URL", "http://127.0.0.1:7810").rstrip("/")
 API_KEY = os.environ.get("TTS_API_KEY", "")
 PROTOCOL = "2024-11-05"
 SERVER_INFO = {"name": "voxcpm2-studio", "version": "1.0.0"}
@@ -39,11 +39,16 @@ def _request(path: str, payload: dict | None = None, method: str = "GET", timeou
 
 
 def _http_error_message(exc: urllib.error.HTTPError) -> str:
+    """错误体里的 error 既可能是字符串（老接口），也可能是 {code, message}（规范层）。"""
     try:
         body = json.loads(exc.read().decode("utf-8"))
-        return f"{body.get('error')}: {body.get('message')}"
     except Exception:  # noqa: BLE001
         return f"HTTP {exc.code}"
+    err = body.get("error")
+    if isinstance(err, dict):
+        code = err.get("code") or "error"
+        return f"{code}: {err.get('message') or body.get('message') or ''}".strip()
+    return f"{err}: {body.get('message')}"
 
 
 # ------------------------------------------------------------------ #
@@ -111,10 +116,17 @@ def tool_cancel(args: dict) -> dict:
 # ------------------------------------------------------------------ #
 # MCP 描述
 # ------------------------------------------------------------------ #
+def _read_only() -> dict[str, bool]:
+    """只读工具的四件套注解。MCP / OpenAI 目录要求四个 hint 全部显式给出。"""
+    return {"readOnlyHint": True, "destructiveHint": False,
+            "idempotentHint": True, "openWorldHint": False}
+
+
 TOOLS = [
     {
         "name": "tts_health",
         "description": "检查本机 VoxCPM2 Studio 是否在运行、模型是否已加载、显存占用与忙闲状态。",
+        "annotations": _read_only(),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -124,11 +136,13 @@ TOOLS = [
             "clone（情绪/语速/语气）。用 tts_synthesize 时把这些标签放进 tags 参数，"
             "服务端会按维度顺序拼成一句描述。"
         ),
+        "annotations": _read_only(),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "tts_params",
         "description": "返回生成参数的默认值与官方推荐区间（CFG 1.0–3.0、扩散步数 4–30）。",
+        "annotations": _read_only(),
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
@@ -138,6 +152,9 @@ TOOLS = [
             "clone 用 5–30 秒参考音频克隆；ultimate 需要参考音频 + 其逐字文本，相似度最高。"
             "返回保存好的 wav 路径、时长、耗时与 RTF。"
         ),
+        # 写本地文件 + 占 GPU：不是只读，也不幂等（同一文本每次都是一次新的生成）
+        "annotations": {"readOnlyHint": False, "destructiveHint": False,
+                        "idempotentHint": False, "openWorldHint": False},
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -183,6 +200,9 @@ TOOLS = [
     {
         "name": "tts_cancel",
         "description": "取消一个正在进行的合成任务（需要 job_id）。",
+        # 会终止一个已在运行的生成，属于破坏性操作；重复取消同一个 id 结果不变
+        "annotations": {"readOnlyHint": False, "destructiveHint": True,
+                        "idempotentHint": True, "openWorldHint": False},
         "inputSchema": {
             "type": "object",
             "properties": {"job_id": {"type": "string"}},
